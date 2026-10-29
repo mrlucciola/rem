@@ -1,0 +1,985 @@
+#!/usr/bin/env python3
+# rem: permanent memory for AI agents. One file, no dependencies, nothing in the background.
+#
+# Model. An append-only log of one-line memories, plus a cache of one-line summaries over
+# aligned power-of-two blocks of that log. Memory i is the LOG_REC bytes at i*LOG_REC; the
+# summary of [k*s, (k+1)*s) is the TREE_REC bytes at k*TREE_REC of TREE/<s>. Position is
+# identity, so a lookup is one seek, the tree needs no index, and it can always be rebuilt.
+#
+# Protocol. The tool never calls a model. A block whose last memory exists but whose summary
+# does not is DEBT. Commands report debt in one line; the agent pays it when it chooses, in
+# one batch, with `nap`. Wake renders the whole log in WAKE_LINES lines, finest toward the
+# present; a missing summary is rendered as its children (within a slack) instead of failing.
+# Pins are the one non-recency axis: ids the agent marks as in view every session.
+#
+# Layout. LOG.txt and TREE/ are byte-compatible with OptMem (VictorTaelin/OptMem); PINS is new.
+#
+# Sections: knobs | errors | store | log | tree | pins | cover | prompts | commands | cli
+
+import datetime
+import heapq
+import io
+import os
+import re
+import sys
+import time
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+# ---------------------------------------------------------------- knobs
+
+KNOBS = {
+    "WAKE_LINES":  (96,    "lines wake may print: a reading budget, not a storage limit"),
+    "PIN_LINES":   (16,    "pinned memories above this count make wake warn"),
+    "ENTRY_CHARS": (280,   "max bytes in one memory or one summary"),
+    "RAW_MAX":     (32,    "blocks up to this size are summarized from raw memories"),
+    "NAP_MAX":     (64,    "max summaries asked for in one nap batch"),
+    "PART_CHARS":  (20000, "max bytes per output part"),
+    "PART_LINES":  (500,   "max lines per output part"),
+}
+DEFAULTS = {k: v for k, (v, _) in KNOBS.items()}
+globals().update(DEFAULTS)
+
+LOG_REC = 320     # "#<id> <date> <text>" space-padded, newline at byte LOG_REC-1
+TREE_REC = 288    # "<summary>" space-padded, newline at byte TREE_REC-1
+DEBT_SLACK = 2    # wake may spend up to DEBT_SLACK*WAKE_LINES lines standing in for missing summaries
+DEDUP_WINDOW = 4096
+ENTRY_CAP = min(TREE_REC - 8, LOG_REC - 40)
+
+
+def pretty(path):
+    home = os.path.expanduser("~")
+    path = os.path.abspath(path)
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+ME = pretty(__file__)
+
+# ---------------------------------------------------------------- errors
+
+
+class Bad(Exception):
+    """A user-facing error. Commands turn it into a one-line message and exit 1."""
+
+
+def die(msg):
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+    sys.exit(1)
+
+
+def plural(n, word):
+    if n == 1:
+        return f"1 {word}"
+    if word.endswith("y"):
+        return f"{n} {word[:-1]}ies"
+    if word.endswith(("s", "x", "ch", "sh")):
+        return f"{n} {word}es"
+    return f"{n} {word}s"
+
+# ---------------------------------------------------------------- store
+
+
+def memory_dir():
+    p = os.environ.get("REM_DIR") or os.environ.get("MEMORY_DIR") or "~/.rem/memory"
+    return os.path.expanduser(p)
+
+
+def log_path(d):
+    return os.path.join(d, "LOG.txt")
+
+
+def tree_path(d, size):
+    return os.path.join(d, "TREE", str(size))
+
+
+def pins_path(d):
+    return os.path.join(d, "PINS")
+
+
+def config_path(d):
+    return os.path.join(d, "config")
+
+
+def store():
+    d = memory_dir()
+    if not os.path.isdir(d):
+        die(f"{d}: no memory store here. Run: {ME} init")
+    os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
+    for p in (log_path(d), pins_path(d)):
+        if not os.path.exists(p):
+            open(p, "ab").close()
+    return d
+
+
+class Lock:
+    """Exclusive lock on <store>/.lock. Serialises every write; reads are lock-free."""
+
+    def __init__(self, d):
+        self.f = open(os.path.join(d, ".lock"), "ab")
+
+    def __enter__(self):
+        if fcntl:
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        else:
+            import msvcrt
+            deadline = time.time() + 30
+            while True:
+                try:
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.time() > deadline:
+                        raise
+                    time.sleep(0.01)
+        return self
+
+    def __exit__(self, *exc):
+        if fcntl:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+        else:
+            import msvcrt
+            msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+        self.f.close()
+
+
+def size_value(k, v, where=""):
+    try:
+        n = int(v)
+    except ValueError:
+        raise Bad(f"{where}{k} must be a positive integer, got {v!r}")
+    if n <= 0:
+        raise Bad(f"{where}{k} must be a positive integer, got {n}")
+    if k == "ENTRY_CHARS" and n > ENTRY_CAP:
+        raise Bad(f"{where}ENTRY_CHARS may not exceed {ENTRY_CAP}")
+    return n
+
+
+def overrides(d):
+    out = {}
+    p = config_path(d)
+    if not os.path.exists(p):
+        return out
+    with open(p, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            body = line.split("#", 1)[0].strip()
+            if not body:
+                continue
+            if "=" not in body:
+                raise Bad(f"{p}:{i}: expected NAME = value")
+            k, v = (x.strip() for x in body.split("=", 1))
+            k = k.upper()
+            if k not in KNOBS:
+                raise Bad(f"{p}:{i}: unknown setting {k}")
+            out[k] = size_value(k, v, f"{p}:{i}: ")
+    return out
+
+
+def apply_config(d):
+    globals().update(DEFAULTS)
+    globals().update(overrides(d))
+
+
+def write_config(d, over):
+    lines = []
+    for k, (v, desc) in KNOBS.items():
+        if k in over:
+            lines.append(f"{k} = {over[k]}  # {desc}")
+        else:
+            lines.append(f"# {k} = {v}  # {desc}")
+    with open(config_path(d), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+# ---------------------------------------------------------------- log
+
+
+def count(path, rec):
+    try:
+        return os.path.getsize(path) // rec
+    except OSError:
+        return 0
+
+
+def log_len(d):
+    return count(log_path(d), LOG_REC)
+
+
+def repair(path, rec):
+    """Drop a torn trailing record left by a crash. Caller holds the lock."""
+    try:
+        n = os.path.getsize(path)
+    except OSError:
+        return
+    if n % rec:
+        with open(path, "r+b") as f:
+            f.truncate(n - n % rec)
+
+
+def pad(text, rec):
+    b = text.encode("utf-8")
+    if len(b) > rec - 1:
+        raise Bad(f"record too long: {len(b)} bytes, limit {rec - 1}")
+    return b + b" " * (rec - 1 - len(b)) + b"\n"
+
+
+def records(buf, rec, path):
+    out = []
+    for i in range(0, len(buf) - len(buf) % rec, rec):
+        try:
+            out.append(buf[i:i + rec].decode("utf-8").rstrip())
+        except UnicodeDecodeError:
+            raise Bad(f"{path}: record at byte {i} is not UTF-8")
+    return out
+
+
+def parse(line):
+    m = re.match(r"#(\d+) (\S+) ?(.*)", line)
+    if not m:
+        raise Bad(f"malformed memory record: {line!r}")
+    return int(m.group(1)), m.group(2), m.group(3)
+
+
+def log_slice(d, lo, hi):
+    if hi <= lo:
+        return []
+    with open(log_path(d), "rb") as f:
+        f.seek(lo * LOG_REC)
+        return records(f.read((hi - lo) * LOG_REC), LOG_REC, log_path(d))
+
+
+def log_get(d, i):
+    r = log_slice(d, i, i + 1)
+    if not r:
+        raise Bad(f"no memory #{i}")
+    return r[0]
+
+
+def log_scan(d, chunk=4096):
+    n = log_len(d)
+    for lo in range(0, n, chunk):
+        for line in log_slice(d, lo, min(n, lo + chunk)):
+            yield line
+
+
+def log_append(d, texts, date):
+    """The only writer of LOG.txt. Returns the id of the first appended memory."""
+    with Lock(d):
+        repair(log_path(d), LOG_REC)
+        n = log_len(d)
+        with open(log_path(d), "ab") as f:
+            for k, t in enumerate(texts):
+                f.write(pad(f"#{n + k} {date} {t}", LOG_REC))
+            f.flush()
+            os.fsync(f.fileno())
+        return n
+
+# ---------------------------------------------------------------- tree
+
+
+def bid(lo, hi):
+    return f"{lo}-{hi - 1}"
+
+
+def block_id(s):
+    m = re.fullmatch(r"(\d+)-(\d+)", s.strip())
+    if not m:
+        raise Bad(f"{s!r}: a block looks like <lo>-<hi>, for example 0-15")
+    lo, hi = int(m.group(1)), int(m.group(2)) + 1
+    size = hi - lo
+    if size < 2 or size & (size - 1) or lo % size:
+        raise Bad(f"{s}: not a block. Blocks are aligned powers of two: 0-1, 2-3, 0-3, 4-7, 0-7 ...")
+    return lo, hi
+
+
+def tree_get(d, lo, hi):
+    size = hi - lo
+    p = tree_path(d, size)
+    k = lo // size
+    try:
+        with open(p, "rb") as f:
+            f.seek(k * TREE_REC)
+            buf = f.read(TREE_REC)
+    except OSError:
+        return None
+    if len(buf) < TREE_REC:
+        return None
+    try:
+        text = buf.decode("utf-8").rstrip()
+    except UnicodeDecodeError:
+        raise Bad(f"{p}: summary #{bid(lo, hi)} is not UTF-8. Repair: {ME} forget {bid(lo, hi)}")
+    return text or None
+
+
+def tree_put(d, lo, hi, text):
+    """Append summary for [lo,hi) if it is the next block of its level.
+    Returns 'stored', 'settled' (already there), or the block id this one waits on."""
+    size = hi - lo
+    p = tree_path(d, size)
+    k = lo // size
+    with Lock(d):
+        repair(p, TREE_REC)
+        have = count(p, TREE_REC)
+        if k < have:
+            return "settled"
+        if k > have:
+            return bid(have * size, (have + 1) * size)
+        with open(p, "ab") as f:
+            f.write(pad(text, TREE_REC))
+            f.flush()
+            os.fsync(f.fileno())
+        return "stored"
+
+
+def tree_drop(d, lo, hi):
+    """Forget [lo,hi) and everything built on it. Never touches the log."""
+    dropped = []
+    size = hi - lo
+    n = log_len(d)
+    with Lock(d):
+        while size <= max(n, hi):
+            p = tree_path(d, size)
+            k = lo // size
+            have = count(p, TREE_REC)
+            if have > k:
+                with open(p, "r+b") as f:
+                    f.truncate(k * TREE_REC)
+                dropped += [(j * size, (j + 1) * size) for j in range(k, have)]
+            size *= 2
+    return dropped
+
+
+def pending(d, T):
+    """Blocks with hi <= T and no summary, smallest level first, left to right."""
+    out = []
+    size = 2
+    while size <= T:
+        have = count(tree_path(d, size), TREE_REC)
+        out += [(k * size, (k + 1) * size) for k in range(have, T // size)]
+        size *= 2
+    return out
+
+
+def pending_count(d, T):
+    n = 0
+    size = 2
+    while size <= T:
+        n += max(0, T // size - count(tree_path(d, size), TREE_REC))
+        size *= 2
+    return n
+
+# ---------------------------------------------------------------- pins
+
+
+def pins(d):
+    """Ordered set of pinned ids, replayed from append-only +id/-id events."""
+    live = set()
+    try:
+        with open(pins_path(d), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if len(line) > 1 and line[0] in "+-" and line[1:].isdigit():
+                    (live.add if line[0] == "+" else live.discard)(int(line[1:]))
+    except OSError:
+        pass
+    return sorted(live)
+
+
+def pin_event(d, sign, i):
+    with Lock(d):
+        with open(pins_path(d), "ab") as f:
+            f.write(f"{sign}{i}\n".encode())
+            f.flush()
+            os.fsync(f.fileno())
+
+# ---------------------------------------------------------------- cover
+
+
+def decomposition(T):
+    """[0,T) as aligned power-of-two blocks, largest first: the coarsest cover."""
+    out, lo = [], 0
+    for bit in range(T.bit_length() - 1, -1, -1):
+        s = 1 << bit
+        if T & s:
+            out.append((lo, lo + s))
+            lo += s
+    return out
+
+
+def cover(T, budget):
+    """At most `budget` aligned blocks tiling [0,T), finest toward T.
+
+    Greedy priority split: a block's priority is size/age (age = T - lo). Splitting in
+    priority order until the budget is spent yields the threshold cover "split while
+    size > alpha*age" for the finest alpha that fits, with no search over alpha.
+    If even the coarsest cover exceeds the budget (budget < popcount(T)) it is returned as is.
+    """
+    if T <= budget:
+        return [(i, i + 1) for i in range(T)]
+    leaves, heap = [], []
+
+    def push(lo, hi):
+        if hi - lo == 1:
+            leaves.append((lo, hi))
+        else:
+            heapq.heappush(heap, (-(hi - lo) / (T - lo), -lo, lo, hi))
+
+    for lo, hi in decomposition(T):
+        push(lo, hi)
+    n = len(leaves) + len(heap)
+    while heap and n < budget:
+        _, _, lo, hi = heapq.heappop(heap)
+        mid = (lo + hi) // 2
+        push(lo, mid)
+        push(mid, hi)
+        n += 1
+    return sorted(leaves + [(lo, hi) for _, _, lo, hi in heap])
+
+# ---------------------------------------------------------------- prompts
+
+
+def fmt_raw(line):
+    return line
+
+
+def fmt_sum(lo, hi, text):
+    return f"#{bid(lo, hi)} {text}"
+
+
+def render(d, lo, hi):
+    """Lines for block [lo,hi): its summary, or recursively its children when missing.
+    Returns (lines, missing_blocks)."""
+    if hi - lo == 1:
+        return [log_get(d, lo)], []
+    s = tree_get(d, lo, hi)
+    if s is not None:
+        return [fmt_sum(lo, hi, s)], []
+    mid = (lo + hi) // 2
+    l1, m1 = render(d, lo, mid)
+    l2, m2 = render(d, mid, hi)
+    return l1 + l2, m1 + m2 + [(lo, hi)]
+
+
+def nap_batch(d, T):
+    """The debt prompt: every pending block whose inputs are available, grouped by input,
+    capped at PART_CHARS. Returns (text, included, total) or (None, 0, 0)."""
+    pend = pending(d, T)
+    if not pend:
+        return None, 0, 0
+    budget = PART_CHARS
+    chunks, included = [], []
+
+    def take(lines, blocks):
+        nonlocal budget
+        cost = sum(len(x.encode("utf-8")) + 1 for x in lines)
+        if chunks and (cost > budget or len(included) + len(blocks) > NAP_MAX):
+            return False
+        budget -= cost
+        chunks.append(lines)
+        included.extend(blocks)
+        return True
+
+    groups = {}
+    for lo, hi in pend:
+        if hi - lo <= RAW_MAX:
+            groups.setdefault(lo - lo % RAW_MAX, []).append((lo, hi))
+    full = True
+    for g in sorted(groups):
+        ghi = min(g + RAW_MAX, T)
+        blocks = sorted(groups[g], key=lambda b: (b[1] - b[0], b[0]))
+        lines = [f"Memories #{g}-{ghi - 1}:"]
+        lines += ["  " + x for x in log_slice(d, g, ghi)]
+        lines.append("Write: " + " ".join(bid(*b) for b in blocks))
+        if not take(lines, blocks):
+            full = False
+            break
+    if full:
+        have = set(included)
+        for lo, hi in pend:
+            if hi - lo <= RAW_MAX:
+                continue
+            mid = (lo + hi) // 2
+            parts = []
+            for a, b in ((lo, mid), (mid, hi)):
+                s = tree_get(d, a, b)
+                if s is not None:
+                    parts.append(f"  #{bid(a, b)} {s}")
+                elif (a, b) in have:
+                    parts.append(f"  #{bid(a, b)} (the line you write above)")
+                else:
+                    parts = None
+                    break
+            if parts is None:
+                continue
+            if not take([f"Summaries for #{bid(lo, hi)}:"] + parts + [f"Write: {bid(lo, hi)}"], [(lo, hi)]):
+                break
+            have.add((lo, hi))
+    head = [
+        f"Memory debt: {plural(len(pend), 'summary')} ({len(included)} in this batch).",
+        f"Each summary is ONE line of at most {ENTRY_CHARS} bytes: keep what has lasting effect,",
+        "drop the rest, invent nothing. Submit all of them in one call:",
+        f"  {ME} nap <<'EOF'",
+        "  <lo>-<hi> <line>",
+        "  EOF",
+        "",
+    ]
+    body = []
+    for c in chunks:
+        body += c + [""]
+    rest = len(pend) - len(included)
+    tail = [f"Then {plural(rest, 'summary')} more: run {ME} nap again."] if rest else []
+    return "\n".join(head + body + tail).rstrip("\n") + "\n", len(included), len(pend)
+
+
+def debt_line(d, T):
+    n = pending_count(d, T)
+    return f"Memory debt: {plural(n, 'summary')}. Pay it at a pause: {ME} nap" if n else None
+
+
+def paginate(lines):
+    parts, cur, size = [], [], 0
+    for line in lines:
+        cost = len(line.encode("utf-8")) + 1
+        if cur and (len(cur) >= PART_LINES or size + cost > PART_CHARS):
+            parts.append(cur)
+            cur, size = [], 0
+        cur.append(line)
+        size += cost
+    if cur or not parts:
+        parts.append(cur)
+    return parts
+
+
+TEMPLATE = """\
+## Memory
+
+You have permanent memory across sessions and models. Tool: `{rem}`. Store: `{data}`. Never edit the store by hand.
+
+- First action of every session, before anything else: `{rem} wake`. Read all of it; obey any `Run:` line it ends with.
+- When you learn something that will still matter next session (a fact, a lesson, a decision, a user preference), save it at once: `{rem} note "<one line, at most {chars} bytes>"`. Not transient state, not what memory already holds. Add `--pin` only for the few facts that must be in view every session; keep pins few, `{rem} unpin <id>` when one stops mattering.
+- When any command reports memory debt, pay it at the next natural pause and always before you end the session: `{rem} nap` prints the pending summaries; answer with the exact command it shows.
+- To look something up: `{rem} recall <regex>` searches every memory verbatim; `{rem} zoom <a-b>` opens a summary line into its halves, down to the memories.
+- Subagents do not run `{rem}`; say so when spawning one and note their findings yourself.
+"""
+
+# ---------------------------------------------------------------- commands
+
+
+def norm(text):
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def check(text):
+    text = text.strip()
+    if not text:
+        raise Bad("empty: a memory needs text")
+    if "\n" in text or "\r" in text:
+        raise Bad("a memory is one line")
+    n = len(text.encode("utf-8"))
+    if n > ENTRY_CHARS:
+        raise Bad(f"too long: {n} bytes, limit {ENTRY_CHARS}. Say less.")
+    return text
+
+
+def known(d, text, n):
+    """The most recent memory, within DEDUP_WINDOW or pinned, whose normalised text matches."""
+    key = norm(text)
+    lo = max(0, n - DEDUP_WINDOW)
+    hit = None
+    for line in log_slice(d, lo, n):
+        if norm(parse(line)[2]) == key:
+            hit = line
+    if hit:
+        return hit
+    for i in pins(d):
+        if i < lo and norm(parse(log_get(d, i))[2]) == key:
+            return log_get(d, i)
+    return None
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def usage():
+    return f"""rem: permanent memory for AI agents.
+
+  {ME} init                   create the store, print the prompt block for your agent
+  {ME} wake [part [T]]        read memory, oldest first; run first in every session
+  {ME} note [--pin] [--force] "<text>"   save one memory (<= {ENTRY_CHARS} bytes)
+  {ME} nap                    print pending summaries to write
+  {ME} nap "<a-b> <line>" ... store summaries (or feed lines on stdin)
+  {ME} recall <regex>         search every memory
+  {ME} zoom <a-b>             open a summary into its two halves
+  {ME} pin <id> | unpin <id>  keep a memory in view every session, or stop
+  {ME} forget <a-b>           drop a bad summary; the next nap rebuilds it
+  {ME} status                 counts: memories, pins, debt
+  {ME} config [NAME=VALUE]    show or set sizes
+  {ME} import <file>          append lines of "YYYY-MM-DD <text>"
+
+Store: {memory_dir()}  (set $REM_DIR to move it)
+"""
+
+
+def cmd_init(d, args):
+    if args:
+        raise Bad("init takes no arguments")
+    os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
+    for p in (log_path(d), pins_path(d)):
+        if not os.path.exists(p):
+            open(p, "ab").close()
+    if not os.path.exists(config_path(d)):
+        write_config(d, {})
+    print(f"Memory store: {d}\n")
+    print("Add this to your agent's AGENTS.md / CLAUDE.md:\n")
+    print(TEMPLATE.format(rem=ME, data=pretty(d), chars=ENTRY_CHARS))
+
+
+def cmd_wake(d, args):
+    if len(args) > 2 or any(not a.isdigit() for a in args):
+        raise Bad("usage: wake [part [T]]")
+    part = int(args[0]) if args else 1
+    n = log_len(d)
+    T = int(args[1]) if len(args) > 1 else n
+    if T > n:
+        raise Bad(f"T={T} is in the future: only {plural(n, 'memory')} exist")
+    if T == 0:
+        print(f"No memories yet. Save one with: {ME} note \"<text>\"")
+        print("You are awake.")
+        return
+    pinned = [i for i in pins(d) if i < T]
+    budget = max(WAKE_LINES - len(pinned), WAKE_LINES // 2)
+    lines, missing = [], []
+    for lo, hi in cover(T, budget):
+        l, m = render(d, lo, hi)
+        lines += l
+        missing += m
+    pend = set(pending(d, T))
+    bad = [b for b in missing if b not in pend]
+    if bad:
+        lo, hi = bad[0]
+        raise Bad(f"summary #{bid(lo, hi)} is blank or corrupt. Repair: {ME} forget {bid(lo, hi)}")
+    if len(lines) > WAKE_LINES * DEBT_SLACK:
+        print(f"Cannot wake within budget: {plural(len(pend), 'summary')} pending would need "
+              f"{len(lines)} lines (budget {WAKE_LINES}).")
+        print(f"Run: {ME} nap")
+        sys.exit(1)
+    doc = []
+    if pinned:
+        doc.append(f"Pinned ({len(pinned)}):")
+        doc += [log_get(d, i) for i in pinned]
+        if len(pinned) > PIN_LINES:
+            doc.append(f"({len(pinned)} pins exceed PIN_LINES={PIN_LINES}; unpin what no longer needs to be in view.)")
+    doc.append(f"Memory ({plural(T, 'memory')}, oldest first):")
+    doc += lines
+    parts = paginate(doc)
+    if not 1 <= part <= len(parts):
+        raise Bad(f"no part {part}: wake has {plural(len(parts), 'part')}")
+    if len(parts) > 1:
+        print(f"Your memory, part {part} of {len(parts)}.")
+    print("\n".join(parts[part - 1]))
+    if part < len(parts):
+        print(f"Not awake yet. Run: {ME} wake {part + 1} {T}")
+        return
+    print("You are awake.")
+    debt = debt_line(d, T)
+    if debt:
+        print(debt)
+
+
+def cmd_note(d, args):
+    flags = {a for a in args if a in ("--pin", "--force")}
+    texts = [a for a in args if a not in flags]
+    if len(texts) != 1:
+        raise Bad(f'usage: note [--pin] [--force] "<text>"')
+    text = check(texts[0])
+    n = log_len(d)
+    dup = None if "--force" in flags else known(d, text, n)
+    if dup:
+        i, date, _ = parse(dup)
+        print(f"Already known as #{i} ({date}). Nothing saved; add --force to save anyway.")
+        if "--pin" in flags and i not in pins(d):
+            pin_event(d, "+", i)
+            print(f"Pinned #{i}.")
+        return
+    i = log_append(d, [text], today())
+    if "--pin" in flags:
+        pin_event(d, "+", i)
+        print(f"Saved and pinned as #{i}.")
+    else:
+        print(f"Saved as #{i}.")
+    debt = debt_line(d, i + 1)
+    if debt:
+        print(debt)
+
+
+def read_nap_input(args):
+    if args and args != ["-"]:
+        raw = "\n".join(args)
+    elif args == ["-"] or not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    else:
+        raw = ""
+    entries, errors = [], []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line == "EOF":
+            continue
+        m = re.match(r"#?(\d+-\d+)\s+(.*)", line)
+        if not m:
+            errors.append(f"skipped {line[:60]!r}: expected <lo>-<hi> <line>")
+            continue
+        try:
+            lo, hi = block_id(m.group(1))
+            entries.append((lo, hi, check(m.group(2))))
+        except Bad as e:
+            errors.append(f"#{m.group(1)}: {e}")
+    return entries, errors
+
+
+def cmd_nap(d, args):
+    T = log_len(d)
+    entries, errors = read_nap_input(args)
+    if not entries and not errors:
+        text, included, total = nap_batch(d, T)
+        if not text:
+            print("No memory debt.")
+            return
+        sys.stdout.write(text)
+        return
+    seen = {}
+    for lo, hi, text in entries:
+        seen[(lo, hi)] = text
+    stored = settled = 0
+    for lo, hi in sorted(seen, key=lambda b: (b[1] - b[0], b[0])):
+        if hi > T:
+            errors.append(f"#{bid(lo, hi)}: ends after the newest memory (#{T - 1})")
+            continue
+        r = tree_put(d, lo, hi, seen[(lo, hi)])
+        if r == "stored":
+            stored += 1
+        elif r == "settled":
+            settled += 1
+        else:
+            errors.append(f"#{bid(lo, hi)}: not next at its level; #{r} comes first")
+    msg = f"Stored {plural(stored, 'summary')}."
+    if settled:
+        msg += f" {settled} already settled, unchanged."
+    print(msg)
+    for e in errors:
+        print(e)
+    left = pending_count(d, T)
+    print(f"Memory debt: {plural(left, 'summary')}." + (f" Run: {ME} nap" if left else " Clear."))
+    if errors:
+        sys.exit(1)
+
+
+def cmd_recall(d, args):
+    if len(args) != 1:
+        raise Bad("usage: recall <regex>")
+    try:
+        rx = re.compile(args[0], re.IGNORECASE)
+    except re.error as e:
+        raise Bad(f"bad regex: {e}")
+    hits, size, dropped = [], 0, 0
+    for line in log_scan(d):
+        if rx.search(line):
+            hits.append(line)
+    kept = []
+    for line in reversed(hits):
+        cost = len(line.encode("utf-8")) + 1
+        if size + cost > PART_CHARS:
+            dropped += 1
+            continue
+        kept.append(line)
+        size += cost
+    kept.reverse()
+    if not hits:
+        print("No match.")
+        return
+    print("\n".join(kept))
+    tail = f"{plural(len(hits), 'match')}."
+    if dropped:
+        tail += f" Showing the newest {len(kept)}; narrow the pattern for the rest."
+    print(tail)
+
+
+def cmd_zoom(d, args):
+    if len(args) != 1:
+        raise Bad("usage: zoom <a-b>")
+    lo, hi = block_id(args[0])
+    T = log_len(d)
+    if lo >= T:
+        raise Bad(f"#{bid(lo, hi)} starts after the newest memory (#{T - 1})")
+    mid = (lo + hi) // 2
+    for a, b in ((lo, mid), (mid, hi)):
+        if a >= T:
+            continue
+        if b - a == 1:
+            print(log_get(d, a))
+        else:
+            s = tree_get(d, a, b)
+            print(fmt_sum(a, b, s) if s is not None else f"#{bid(a, b)} (not compressed yet)")
+
+
+def cmd_pin(d, args):
+    if len(args) != 1 or not args[0].lstrip("#").isdigit():
+        raise Bad("usage: pin <id>")
+    i = int(args[0].lstrip("#"))
+    if i >= log_len(d):
+        raise Bad(f"no memory #{i}")
+    if i in pins(d):
+        print(f"#{i} is already pinned.")
+        return
+    pin_event(d, "+", i)
+    print(f"Pinned #{i}: {parse(log_get(d, i))[2]}")
+
+
+def cmd_unpin(d, args):
+    if len(args) != 1 or not args[0].lstrip("#").isdigit():
+        raise Bad("usage: unpin <id>")
+    i = int(args[0].lstrip("#"))
+    if i not in pins(d):
+        print(f"#{i} is not pinned.")
+        return
+    pin_event(d, "-", i)
+    print(f"Unpinned #{i}.")
+
+
+def cmd_forget(d, args):
+    if len(args) != 1:
+        raise Bad("usage: forget <a-b>")
+    lo, hi = block_id(args[0])
+    dropped = tree_drop(d, lo, hi)
+    if not dropped:
+        raise Bad(f"#{bid(lo, hi)} has no summary to forget")
+    print(f"Forgot {plural(len(dropped), 'summary')}: " + " ".join(bid(*b) for b in dropped))
+    print(f"The next nap rebuilds them from the log. Run: {ME} nap")
+
+
+def cmd_status(d, args):
+    if args:
+        raise Bad("status takes no arguments")
+    n = log_len(d)
+    levels = []
+    size = 2
+    while size <= max(n, 2):
+        have = count(tree_path(d, size), TREE_REC)
+        if have:
+            levels.append(f"{size}:{have}")
+        size *= 2
+    print(f"store     {d}")
+    print(f"memories  {n}")
+    print(f"pins      {len(pins(d))}")
+    print(f"debt      {pending_count(d, n)}")
+    print(f"tree      {' '.join(levels) or '(empty)'}")
+
+
+def cmd_config(d, args):
+    over = overrides(d)
+    if not args:
+        for k, (v, desc) in KNOBS.items():
+            mark = "" if k not in over else f"  (default {v})"
+            print(f"{k:<12} {globals()[k]:>6}  {desc}{mark}")
+        return
+    for a in args:
+        if "=" not in a:
+            raise Bad(f"{a!r}: expected NAME=VALUE")
+        k, v = (x.strip() for x in a.split("=", 1))
+        k = k.upper()
+        if k not in KNOBS:
+            raise Bad(f"unknown setting {k}. Settings: {' '.join(KNOBS)}")
+        if v == "":
+            over.pop(k, None)
+        else:
+            over[k] = size_value(k, v)
+    write_config(d, over)
+    apply_config(d)
+    for k in KNOBS:
+        print(f"{k:<12} {globals()[k]:>6}")
+
+
+def cmd_import(d, args):
+    if len(args) != 1:
+        raise Bad("usage: import <file>")
+    p = args[0]
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = f.read().splitlines()
+    except UnicodeDecodeError:
+        raise Bad(f"{p}: not UTF-8")
+    n = log_len(d)
+    last = parse(log_get(d, n - 1))[1] if n else ""
+    items = []
+    for i, line in enumerate(raw, 1):
+        if not line.strip():
+            continue
+        m = re.match(r"(\d{4}-\d{2}-\d{2}) (.*)", line)
+        if not m:
+            raise Bad(f"{p}:{i}: expected YYYY-MM-DD <text>")
+        date, text = m.group(1), m.group(2)
+        try:
+            datetime.date.fromisoformat(date)
+        except ValueError:
+            raise Bad(f"{p}:{i}: {date} is not a date")
+        if date < last:
+            raise Bad(f"{p}:{i}: {date} is earlier than the previous memory ({last})")
+        last = date
+        try:
+            items.append((date, check(text)))
+        except Bad as e:
+            raise Bad(f"{p}:{i}: {e}")
+    if not items:
+        raise Bad(f"{p}: nothing to import")
+    first = None
+    with Lock(d):
+        repair(log_path(d), LOG_REC)
+        first = log_len(d)
+        with open(log_path(d), "ab") as f:
+            for k, (date, text) in enumerate(items):
+                f.write(pad(f"#{first + k} {date} {text}", LOG_REC))
+            f.flush()
+            os.fsync(f.fileno())
+    print(f"Imported #{first}-#{first + len(items) - 1}.")
+    debt = debt_line(d, first + len(items))
+    if debt:
+        print(debt)
+
+
+COMMANDS = {
+    "init": cmd_init, "wake": cmd_wake, "note": cmd_note, "nap": cmd_nap,
+    "recall": cmd_recall, "zoom": cmd_zoom, "pin": cmd_pin, "unpin": cmd_unpin,
+    "forget": cmd_forget, "status": cmd_status, "config": cmd_config, "import": cmd_import,
+}
+
+# ---------------------------------------------------------------- cli
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if not argv:
+        print(usage())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd not in COMMANDS:
+        sys.stderr.write(f"No such command: {cmd}\n\n{usage()}")
+        return 1
+    try:
+        if cmd == "init":
+            cmd_init(memory_dir(), args)
+        else:
+            d = store()
+            apply_config(d)
+            COMMANDS[cmd](d, args)
+    except Bad as e:
+        die(str(e))
+    except OSError as e:
+        die(f"{e.filename or ''}: {e.strerror or e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
