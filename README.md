@@ -3,14 +3,108 @@
 Permanent memory for AI agents. One Python 3 script, no dependencies, nothing in the
 background, and a prompt block of about 330 tokens. A reimplementation of
 [OptMem](https://github.com/VictorTaelin/OptMem) with the same storage and a leaner protocol;
-the reasoning is in [docs/design.md](docs/design.md).
+the reasoning is in [docs/design.md](/docs/design.md).
 
+## Install
+
+Requirements: `git` and `python3` (3.8 or newer). macOS has both after `xcode-select --install`;
+most Linux distributions ship them. Windows: use WSL; native Windows is untested.
+
+### From a clone
+
+```sh
+git clone https://github.com/mrlucciola/rem.git ~/rem
+mkdir -p ~/.rem
+ln -sf ~/rem/rem ~/.rem/rem
+~/.rem/rem init
 ```
+
+`init` creates `~/.rem/memory` and prints a block headed `## Memory`. Paste that block into
+the instructions file your agent reads on every session:
+
+| Agent | File |
+|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` (global) or `<repo>/CLAUDE.md` (one project) |
+| Codex CLI | `~/.codex/AGENTS.md` |
+| anything else | whatever it loads first; the block is plain markdown |
+
+The symlink means `git -C ~/rem pull` is the update. Nothing else to do; the store is untouched.
+
+Check it:
+
+```sh
+~/.rem/rem status
+# expect: store ~/.rem/memory, memories 0, pins 0, debt 0
+~/.rem/rem note "rem installed on this machine"
+~/.rem/rem wake
+```
+
+### One-liner instead of a clone
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/mrlucciola/rem/main/install.sh | sh
 ```
 
-That puts the tool at `~/.rem/rem`, creates `~/.rem/memory`, and prints the block to paste
-into your agent's `AGENTS.md` or `CLAUDE.md`. Rerun the line to update.
+Copies the script to `~/.rem/rem` and runs `init`. Rerun the line to update.
+
+### Claude Code: skip the permission prompts
+
+By default Claude Code asks before every shell command, so every `wake` and `note` would
+interrupt you. Allow the tool once, in `~/.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(~/.rem/rem:*)"]
+  }
+}
+```
+
+### Claude Code, optional: wake automatically
+
+The prompt block tells the agent to run `wake` first. To make that a guarantee rather than an
+instruction, run it from a `SessionStart` hook; the hook's output is added to the session's
+context. In `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "~/.rem/rem wake" } ] }
+    ]
+  }
+}
+```
+
+Keep the `wake` line in the prompt block anyway: it is what the agent follows after a context
+compaction, when hooks do not rerun.
+
+### Memory on more than one machine
+
+The repo carries the tool, not your memories. To carry memory, keep the store in a folder that
+syncs (iCloud, Dropbox, a private git repo you push after sessions) and point both machines at
+it:
+
+```sh
+export REM_DIR=~/Sync/rem-memory      # in ~/.zshrc or ~/.bashrc, before the agent starts
+~/.rem/rem init
+```
+
+The store is three append-only files, so sync conflicts are rare and never destroy earlier
+memories. Do not run two agents against one store across machines at the same moment: the
+write lock is per machine.
+
+### Moving from OptMem
+
+`LOG.txt` and `TREE/` are byte-compatible. Point rem at the old store and carry on; a `PINS`
+file is created on first use:
+
+```sh
+export REM_DIR=~/.optmem/memory
+~/.rem/rem status
+```
+
+Then replace OptMem's block in your instructions file with the one `rem init` prints.
 
 ## What the agent does
 
