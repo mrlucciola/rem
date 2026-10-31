@@ -7,10 +7,8 @@ the reasoning is in [docs/design.md](/docs/design.md).
 
 ## Install
 
-Requirements: `git` and `python3` (3.8 or newer). macOS has both after `xcode-select --install`;
-most Linux distributions ship them. Windows: use WSL; native Windows is untested.
-
-### From a clone
+Requirements: `git` and `python3` (3.8 or newer). Installation touches the network only for
+the `git clone`.
 
 ```sh
 git clone https://github.com/mrlucciola/rem.git ~/rem
@@ -19,80 +17,14 @@ ln -sf ~/rem/rem ~/.rem/rem
 ~/.rem/rem init
 ```
 
-`init` creates `~/.rem/memory` and prints a block headed `## Memory`. Paste that block into
-the instructions file your agent reads on every session:
+`init` creates `~/.rem/memory` and prints a block headed `## Memory`; paste that block into
+the instructions file your agent reads on every session (`~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md`, ...). The symlink means `git -C ~/rem pull` is the update; the store is
+untouched.
 
-| Agent | File |
-|---|---|
-| Claude Code | `~/.claude/CLAUDE.md` (global) or `<repo>/CLAUDE.md` (one project) |
-| Codex CLI | `~/.codex/AGENTS.md` |
-| anything else | whatever it loads first; the block is plain markdown |
-
-The symlink means `git -C ~/rem pull` is the update. Nothing else to do; the store is untouched.
-
-Check it:
-
-```sh
-~/.rem/rem status
-# expect: store ~/.rem/memory, memories 0, pins 0, debt 0
-~/.rem/rem note "rem installed on this machine"
-~/.rem/rem wake
-```
-
-### One-liner instead of a clone
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/mrlucciola/rem/main/install.sh | sh
-```
-
-Copies the script to `~/.rem/rem` and runs `init`. Rerun the line to update.
-
-### Claude Code: skip the permission prompts
-
-By default Claude Code asks before every shell command, so every `wake` and `note` would
-interrupt you. Allow the tool once, in `~/.claude/settings.json`:
-
-```json
-{
-  "permissions": {
-    "allow": ["Bash(~/.rem/rem:*)"]
-  }
-}
-```
-
-### Claude Code, optional: wake automatically
-
-The prompt block tells the agent to run `wake` first. To make that a guarantee rather than an
-instruction, run it from a `SessionStart` hook; the hook's output is added to the session's
-context. In `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "~/.rem/rem wake" } ] }
-    ]
-  }
-}
-```
-
-Keep the `wake` line in the prompt block anyway: it is what the agent follows after a context
-compaction, when hooks do not rerun.
-
-### Memory on more than one machine
-
-The repo carries the tool, not your memories. To carry memory, keep the store in a folder that
-syncs (iCloud, Dropbox, a private git repo you push after sessions) and point both machines at
-it:
-
-```sh
-export REM_DIR=~/Sync/rem-memory      # in ~/.zshrc or ~/.bashrc, before the agent starts
-~/.rem/rem init
-```
-
-The store is three append-only files, so sync conflicts are rare and never destroy earlier
-memories. Do not run two agents against one store across machines at the same moment: the
-write lock is per machine.
+The step-by-step walkthrough -- which file for which agent, skipping Claude Code's permission
+prompts, the optional wake-on-session-start hook, memory on more than one machine -- is
+[INSTALL.md](/INSTALL.md).
 
 ### Moving from OptMem
 

@@ -112,7 +112,7 @@ Rejected alternatives:
 Implementation plan:
   1. rem (single file): knobs, store, log, tree, pins, cover, prompts, commands, cli.
   2. test_rem.py: OptMem's invariant set ported, plus batch/debt/pin/dedup/compat checks.
-  3. README.md with the prompt block; install.sh.
+  3. README.md with the prompt block; INSTALL.md (clone-only install; network used for the clone alone).
 
 Validation:
   python3 test_rem.py -> all checks pass, including 16-process concurrency and crash repair.
