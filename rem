@@ -256,11 +256,19 @@ def log_get(d, i):
     return r[0]
 
 
-def log_scan(d, chunk=4096):
-    n = log_len(d)
-    for lo in range(0, n, chunk):
-        for line in log_slice(d, lo, min(n, lo + chunk)):
-            yield line
+def scan(path, rec, chunk=4096):
+    """Every record of a fixed-width file, in order, read chunk records at a time."""
+    n = count(path, rec)
+    if not n:
+        return
+    with open(path, "rb") as f:
+        for lo in range(0, n, chunk):
+            for line in records(f.read(min(chunk, n - lo) * rec), rec, path):
+                yield line
+
+
+def log_scan(d):
+    return scan(log_path(d), LOG_REC)
 
 
 def log_append(d, items):
@@ -568,7 +576,7 @@ You have permanent memory across sessions and models. Tool: `{rem}`. Store: `{da
 - First action of every session, before anything else: `{rem} wake`. Read all of it; obey any `Run:` line it ends with.
 - When you learn something that will still matter next session (a fact, a lesson, a decision, a user preference), save it at once: `{rem} note "<one line, at most {chars} bytes>" ["<another>" ...]`. Not transient state, not what memory already holds. Add `--pin` only for the few facts that must be in view every session; keep pins few, `{rem} unpin <id>` when one stops mattering.
 - When any command reports memory debt, pay it at the next natural pause and always before you end the session: `{rem} nap` prints the pending summaries; answer with the exact command it shows.
-- To look something up: `{rem} recall <regex>` searches every memory verbatim; `{rem} zoom <a-b>` opens a summary line into its halves, down to the memories.
+- To look something up: `{rem} recall <regex>` searches every memory and summary verbatim; `{rem} zoom <a-b>` opens a summary line into its halves, down to the memories.
 - Subagents do not run `{rem}`; say so when spawning one and note their findings yourself.
 """
 
@@ -619,7 +627,7 @@ def usage():
   {ME} note [--pin] [--force] "<text>" ...   save memories, one line each (<= {ENTRY_CHARS} bytes)
   {ME} nap                    print pending summaries to write
   {ME} nap "<a-b> <line>" ... store summaries (or feed lines on stdin)
-  {ME} recall <regex>         search every memory
+  {ME} recall <regex>         search every memory and summary
   {ME} zoom <a-b>             open a summary into its two halves
   {ME} pin <id> | unpin <id>  keep a memory in view every session, or stop
   {ME} forget <a-b>           drop a bad summary; the next nap rebuilds it
@@ -811,12 +819,19 @@ def cmd_recall(d, args):
         rx = re.compile(args[0], re.IGNORECASE)
     except re.error as e:
         raise Bad(f"bad regex: {e}")
-    hits, size, dropped = [], 0, 0
-    for line in log_scan(d):
-        if rx.search(line):
-            hits.append(line)
-    kept = []
-    for line in reversed(hits):
+    hits = [line for line in log_scan(d) if rx.search(line)]
+    sums, s = [], 2
+    while s <= log_len(d):
+        for k, text in enumerate(scan(tree_path(d, s), TREE_REC)):
+            if text and rx.search(text):
+                sums.append((k * s, s, fmt_sum(k * s, (k + 1) * s, text)))
+        s *= 2
+    sums = [line for _, _, line in sorted(sums, key=lambda x: (x[0], -x[1]))]
+    if not hits and not sums:
+        print("No match.")
+        return
+    kept, size, dropped = [], 0, 0
+    for line in reversed(hits + sums):
         cost = len(line.encode("utf-8")) + 1
         if size + cost > PART_CHARS:
             dropped += 1
@@ -824,11 +839,10 @@ def cmd_recall(d, args):
         kept.append(line)
         size += cost
     kept.reverse()
-    if not hits:
-        print("No match.")
-        return
     print("\n".join(kept))
     tail = f"{plural(len(hits), 'match')}."
+    if sums:
+        tail = f"{plural(len(hits), 'match')} and {plural(len(sums), 'summary')} (zoom to open one)."
     if dropped:
         tail += f" Showing the newest {len(kept)}; narrow the pattern for the rest."
     print(tail)

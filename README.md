@@ -45,7 +45,7 @@ Then replace OptMem's block in your instructions file with the one `rem init` pr
 | `rem wake` | first thing in every session: the whole memory in about 96 lines, oldest first, finest toward now |
 | `rem note "<one line>" ...` | whenever something durable is learned, several at once if need be; `--pin` for the few facts that must be in view every session |
 | `rem nap` | when a command reports memory debt: prints every pending summary in one batch, the agent answers with one command |
-| `rem recall <regex>` | search every memory verbatim |
+| `rem recall <regex>` | search every memory and every summary verbatim; a summary hit names the block to `zoom` |
 | `rem zoom <a-b>` | open a summary line into its two halves, down to the memories |
 | `rem pin <id>` / `unpin <id>` | keep a memory in view, or stop |
 | `rem forget <a-b>` | drop a bad summary; the next nap rebuilds it |
