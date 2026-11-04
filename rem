@@ -566,7 +566,7 @@ TEMPLATE = """\
 You have permanent memory across sessions and models. Tool: `{rem}`. Store: `{data}`. Never edit the store by hand.
 
 - First action of every session, before anything else: `{rem} wake`. Read all of it; obey any `Run:` line it ends with.
-- When you learn something that will still matter next session (a fact, a lesson, a decision, a user preference), save it at once: `{rem} note "<one line, at most {chars} bytes>"`. Not transient state, not what memory already holds. Add `--pin` only for the few facts that must be in view every session; keep pins few, `{rem} unpin <id>` when one stops mattering.
+- When you learn something that will still matter next session (a fact, a lesson, a decision, a user preference), save it at once: `{rem} note "<one line, at most {chars} bytes>" ["<another>" ...]`. Not transient state, not what memory already holds. Add `--pin` only for the few facts that must be in view every session; keep pins few, `{rem} unpin <id>` when one stops mattering.
 - When any command reports memory debt, pay it at the next natural pause and always before you end the session: `{rem} nap` prints the pending summaries; answer with the exact command it shows.
 - To look something up: `{rem} recall <regex>` searches every memory verbatim; `{rem} zoom <a-b>` opens a summary line into its halves, down to the memories.
 - Subagents do not run `{rem}`; say so when spawning one and note their findings yourself.
@@ -616,7 +616,7 @@ def usage():
 
   {ME} init                   create the store, print the prompt block for your agent
   {ME} wake [part [T]]        read memory, oldest first; run first in every session
-  {ME} note [--pin] [--force] "<text>"   save one memory (<= {ENTRY_CHARS} bytes)
+  {ME} note [--pin] [--force] "<text>" ...   save memories, one line each (<= {ENTRY_CHARS} bytes)
   {ME} nap                    print pending summaries to write
   {ME} nap "<a-b> <line>" ... store summaries (or feed lines on stdin)
   {ME} recall <regex>         search every memory
@@ -700,26 +700,45 @@ def cmd_wake(d, args):
 
 def cmd_note(d, args):
     flags = {a for a in args if a in ("--pin", "--force")}
-    texts = [a for a in args if a not in flags]
-    if len(texts) != 1:
-        raise Bad(f'usage: note [--pin] [--force] "<text>"')
-    text = check(texts[0])
+    texts = [check(a) for a in args if a not in flags]
+    if not texts:
+        raise Bad('usage: note [--pin] [--force] "<text>" ["<text>" ...]')
+    pin, force = "--pin" in flags, "--force" in flags
     n = log_len(d)
-    dup = None if "--force" in flags else known(d, text, n)
-    if dup:
-        i, date, _ = parse(dup)
-        print(f"Already known as #{i} ({date}). Nothing saved; add --force to save anyway.")
-        if "--pin" in flags and i not in pins(d):
-            pin_event(d, "+", i)
-            print(f"Pinned #{i}.")
-        return
-    i = log_append(d, [(today(), text)])
-    if "--pin" in flags:
-        pin_event(d, "+", i)
-        print(f"Saved and pinned as #{i}.")
-    else:
-        print(f"Saved as #{i}.")
-    debt = debt_line(d, i + 1)
+    fresh, plan, batch = [], [], {}
+    for text in texts:
+        key = norm(text)
+        if not force and key in batch:
+            plan.append(("batch", batch[key]))
+            continue
+        dup = None if force else known(d, text, n)
+        if dup:
+            plan.append(("known", parse(dup)))
+            continue
+        batch[key] = len(fresh)
+        plan.append(("new", len(fresh)))
+        fresh.append((today(), text))
+    first = log_append(d, fresh) if fresh else n
+    pinned = set(pins(d)) if pin else set()
+    for kind, x in plan:
+        if kind == "new":
+            i = first + x
+            print(f"Saved and pinned as #{i}." if pin else f"Saved as #{i}.")
+            if pin:
+                pin_event(d, "+", i)
+                pinned.add(i)
+        elif kind == "batch":
+            print(f"Already known as #{first + x} (this call).")
+        else:
+            i, date, _ = x
+            print(f"Already known as #{i} ({date}).")
+            if pin and i not in pinned:
+                pin_event(d, "+", i)
+                pinned.add(i)
+                print(f"Pinned #{i}.")
+    if not fresh:
+        print("Nothing saved; add --force to save anyway.")
+    debt = debt_line(d, first + len(fresh))
     if debt:
         print(debt)
 
