@@ -263,13 +263,13 @@ def log_scan(d, chunk=4096):
             yield line
 
 
-def log_append(d, texts, date):
-    """The only writer of LOG.txt. Returns the id of the first appended memory."""
+def log_append(d, items):
+    """The only writer of LOG.txt. `items` are (date, text) pairs; returns the first new id."""
     with Lock(d):
         repair(log_path(d), LOG_REC)
         n = log_len(d)
         with open(log_path(d), "ab") as f:
-            for k, t in enumerate(texts):
+            for k, (date, t) in enumerate(items):
                 f.write(pad(f"#{n + k} {date} {t}", LOG_REC))
             f.flush()
             os.fsync(f.fileno())
@@ -713,7 +713,7 @@ def cmd_note(d, args):
             pin_event(d, "+", i)
             print(f"Pinned #{i}.")
         return
-    i = log_append(d, [text], today())
+    i = log_append(d, [(today(), text)])
     if "--pin" in flags:
         pin_event(d, "+", i)
         print(f"Saved and pinned as #{i}.")
@@ -942,15 +942,7 @@ def cmd_import(d, args):
             raise Bad(f"{p}:{i}: {e}")
     if not items:
         raise Bad(f"{p}: nothing to import")
-    first = None
-    with Lock(d):
-        repair(log_path(d), LOG_REC)
-        first = log_len(d)
-        with open(log_path(d), "ab") as f:
-            for k, (date, text) in enumerate(items):
-                f.write(pad(f"#{first + k} {date} {text}", LOG_REC))
-            f.flush()
-            os.fsync(f.fileno())
+    first = log_append(d, items)
     print(f"Imported #{first}-#{first + len(items) - 1}.")
     debt = debt_line(d, first + len(items))
     if debt:
