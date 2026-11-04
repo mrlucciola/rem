@@ -3,7 +3,8 @@
 Permanent memory for AI agents. One Python 3 script, no dependencies, nothing in the
 background, and a prompt block of about 330 tokens. A reimplementation of
 [OptMem](https://github.com/VictorTaelin/OptMem) with the same storage and a leaner protocol;
-the reasoning is in [docs/design.md](/docs/design.md).
+the reasoning is in [docs/design.md](/docs/design.md), the component and data-flow view with
+diagrams in [docs/architecture.md](/docs/architecture.md).
 
 ## Install
 

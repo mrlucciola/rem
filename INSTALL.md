@@ -98,8 +98,13 @@ In `~/.claude/settings.json`:
 }
 ```
 
-Keep the wake line in the pasted block anyway: after a context compaction mid-session,
-hooks do not rerun, and the written instruction is what brings the memory back.
+`SessionStart` fires on startup, on `/clear`, on resume, and again after a context
+compaction, so the hook also brings the memory back mid-session. With the hook in place,
+change the first bullet of the pasted block so the agent does not wake a second time:
+
+```
+- Your memory is printed at session start and after every compaction. If it is not in view, run `~/.rem/rem wake`. Obey any `Run:` line it ends with.
+```
 
 A hook's output reaches the agent only when the command exits 0, so `wake` exits 0 even
 when it refuses for too much debt: the agent then sees the `Run: ~/.rem/rem nap` line
