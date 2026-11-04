@@ -105,6 +105,39 @@ A hook's output reaches the agent only when the command exits 0, so `wake` exits
 when it refuses for too much debt: the agent then sees the `Run: ~/.rem/rem nap` line
 instead of nothing. Only real errors (no store, corrupt record) exit 1.
 
+## 8. Optional: make paying debt a guarantee too
+
+The block also tells the agent to pay memory debt before it ends a session. To enforce
+that, a Claude Code `Stop` hook can refuse the first attempt to stop while debt is
+unpaid. Save this as `~/.rem/stop-hook.sh`:
+
+```sh
+#!/bin/sh
+# Claude Code Stop hook: block ending the session once while memory debt is unpaid.
+grep -q '"stop_hook_active": *true' && exit 0
+debt=$(~/.rem/rem status 2>/dev/null | awk '/^debt/ {print $2}')
+[ -z "$debt" ] && exit 0
+[ "$debt" = 0 ] && exit 0
+echo "Memory debt: $debt summaries. Pay it before ending: ~/.rem/rem nap" >&2
+exit 2
+```
+
+Then `chmod +x ~/.rem/stop-hook.sh` and register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "~/.rem/stop-hook.sh" } ] }
+    ]
+  }
+}
+```
+
+Exit 2 sends the stderr line back to the agent as the reason it may not stop yet. The
+`stop_hook_active` check lets the second stop through, so an agent that cannot pay (or
+a store that is missing) never gets stuck in a loop.
+
 ## Updating
 
 ```sh
