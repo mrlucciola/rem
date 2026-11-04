@@ -238,8 +238,20 @@ with open(p, "w") as f:
         f.write(f"{day.isoformat()} imported memory {i} with some words\n")
 r = run("import", p)
 check(r.code == 0 and f"Imported #0-#{N - 1}" in r.out, f"import: {r.err}")
+reads = [0]
+real_log_get = rem.log_get
+
+
+def counting_log_get(*a):
+    reads[0] += 1
+    return real_log_get(*a)
+
+
+rem.log_get = counting_log_get
 r = run("wake")
-check(r.code == 1 and "Cannot wake within budget" in r.out and "nap" in r.out, "debt beyond slack refuses with a pointer")
+rem.log_get = real_log_get
+check(r.code == 0 and "Cannot wake within budget" in r.out and "nap" in r.out, "debt beyond slack refuses with a pointer, exit 0 for hooks")
+check(reads[0] <= rem.WAKE_LINES * rem.DEBT_SLACK, f"refusal reads O(budget) memories, not O(N): {reads[0]}")
 rounds = pay_all()
 total = len(complete(N))
 check(rounds < total / 4, f"batching: {rounds} rounds for {total} summaries")

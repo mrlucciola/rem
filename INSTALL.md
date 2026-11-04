@@ -101,6 +101,10 @@ In `~/.claude/settings.json`:
 Keep the wake line in the pasted block anyway: after a context compaction mid-session,
 hooks do not rerun, and the written instruction is what brings the memory back.
 
+A hook's output reaches the agent only when the command exits 0, so `wake` exits 0 even
+when it refuses for too much debt: the agent then sees the `Run: ~/.rem/rem nap` line
+instead of nothing. Only real errors (no store, corrupt record) exit 1.
+
 ## Updating
 
 ```sh

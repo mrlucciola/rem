@@ -447,18 +447,27 @@ def fmt_sum(lo, hi, text):
     return f"#{bid(lo, hi)} {text}"
 
 
-def render(d, lo, hi):
-    """Lines for block [lo,hi): its summary, or recursively its children when missing.
-    Returns (lines, missing_blocks)."""
+class TooDeep(Exception):
+    """render would print more than its line limit; the caller asks for a nap instead."""
+
+
+def render(d, lo, hi, out, missing, limit):
+    """Append the lines for block [lo,hi) to `out`: its summary, or recursively its children
+    when missing (recording the missing block). Raises TooDeep as soon as `out` would pass
+    `limit` lines, so a store deep in debt costs O(limit), not O(T), to refuse."""
+    if len(out) >= limit:
+        raise TooDeep
     if hi - lo == 1:
-        return [log_get(d, lo)], []
+        out.append(log_get(d, lo))
+        return
     s = tree_get(d, lo, hi)
     if s is not None:
-        return [fmt_sum(lo, hi, s)], []
+        out.append(fmt_sum(lo, hi, s))
+        return
     mid = (lo + hi) // 2
-    l1, m1 = render(d, lo, mid)
-    l2, m2 = render(d, mid, hi)
-    return l1 + l2, m1 + m2 + [(lo, hi)]
+    render(d, lo, mid, out, missing, limit)
+    render(d, mid, hi, out, missing, limit)
+    missing.append((lo, hi))
 
 
 def nap_batch(d, T):
@@ -650,21 +659,22 @@ def cmd_wake(d, args):
         return
     pinned = [i for i in pins(d) if i < T]
     budget = max(WAKE_LINES - len(pinned), WAKE_LINES // 2)
+    limit = WAKE_LINES * DEBT_SLACK
     lines, missing = [], []
-    for lo, hi in cover(T, budget):
-        l, m = render(d, lo, hi)
-        lines += l
-        missing += m
+    try:
+        for lo, hi in cover(T, budget):
+            render(d, lo, hi, lines, missing, limit)
+    except TooDeep:
+        # An instruction, not a failure: exit 0 so a session-start hook still delivers it.
+        print(f"Cannot wake within budget: {plural(pending_count(d, T), 'summary')} pending "
+              f"would need more than {limit} lines (budget {WAKE_LINES}).")
+        print(f"Run: {ME} nap")
+        return
     pend = set(pending(d, T))
     bad = [b for b in missing if b not in pend]
     if bad:
         lo, hi = bad[0]
         raise Bad(f"summary #{bid(lo, hi)} is blank or corrupt. Repair: {ME} forget {bid(lo, hi)}")
-    if len(lines) > WAKE_LINES * DEBT_SLACK:
-        print(f"Cannot wake within budget: {plural(len(pend), 'summary')} pending would need "
-              f"{len(lines)} lines (budget {WAKE_LINES}).")
-        print(f"Run: {ME} nap")
-        sys.exit(1)
     doc = []
     if pinned:
         doc.append(f"Pinned ({len(pinned)}):")
